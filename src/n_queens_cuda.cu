@@ -416,13 +416,14 @@ long long cuda_n_queens(int N, int rows, long long range_start, long long range_
     const char *genv = getenv("NQ_GRID");
     int grid_size = genv ? atoi(genv) : 1024;
     // NQ_SCHED: "static" (default) = one launch per GPU over a fixed split;
-    // "queue" = one launch per GPU, all GPUs pull tasks from one host-pinned
-    // counter (best balance, default when a range is given); "chunk" = GPUs
-    // pull fixed-size chunks from a host queue (many launches).
+    // "chunk" = guided self-scheduling, GPUs pull geometrically shrinking
+    // chunks from a host-side atomic queue (used automatically for ranges).
+    // A host-pinned counter shared across GPUs via atomicAdd_system was tried
+    // and produced duplicated task ids on PCIe nodes (non-atomic across
+    // devices) -- do not resurrect it without hardware validation.
     const char *senv = getenv("NQ_SCHED");
-    const char *sched = senv ? senv : (has_range ? "queue" : "static");
+    const char *sched = senv ? senv : (has_range ? "chunk" : "static");
     bool chunk_sched = strcmp(sched, "chunk") == 0 || strcmp(sched, "dynamic") == 0;
-    bool queue_sched = strcmp(sched, "queue") == 0;
 
     {
         int maxb1 = 0, maxb2 = 0;
@@ -430,92 +431,27 @@ long long cuda_n_queens(int N, int rows, long long range_start, long long range_
             &maxb1, static_cast<void (*)(int, int *, long long *, long long, unsigned long long *)>(n_queens), CU1DBLOCK, 0);
         cudaOccupancyMaxActiveBlocksPerMultiprocessor(&maxb2, n_queens_v4, CU1DBLOCK, 0);
         print_with_time("kernel=v%d grid=%d block=%d sched=%s occupancy: v1 %d blocks/SM, v4 %d blocks/SM\n",
-                        kernel_version, grid_size, CU1DBLOCK, queue_sched ? "queue" : (chunk_sched ? "chunk" : "static"),
+                        kernel_version, grid_size, CU1DBLOCK, chunk_sched ? "chunk" : "static",
                         maxb1, maxb2);
     }
 
-    if (queue_sched) {
-        // One kernel launch per GPU; every task fetch is a system-scope atomic
-        // on a host-pinned counter shared by all GPUs, so the node's GPUs
-        // drain the range together with no static split and no chunk tails.
-        long long span = range_end - range_start;
-        unsigned long long *h_counter;
-        CU_SAFE_CALL(cudaHostAlloc(&h_counter, sizeof(unsigned long long),
-                                   cudaHostAllocPortable | cudaHostAllocMapped));
-        *h_counter = 0;
-
-        vector<long long> gpu_sum(gpu_num, 0);
-
-#pragma omp parallel num_threads(gpu_num)
-        {
-            int idx = omp_get_thread_num();
-            CU_SAFE_CALL(cudaSetDevice(idx));
-
-            struct timeval t0, t1;
-            gettimeofday(&t0, NULL);
-
-            unsigned long long *d_counter;
-            CU_SAFE_CALL(cudaHostGetDevicePointer(&d_counter, h_counter, 0));
-
-            int *cuda_tot;
-            long long *cuda_partial_sum;
-            unsigned long long *cuda_out;
-            CU_SAFE_CALL(cudaMalloc(&cuda_tot, sizeof(int) * span * 3));
-            CU_SAFE_CALL(cudaMalloc(&cuda_partial_sum, sizeof(long long) * span));
-            CU_SAFE_CALL(cudaMalloc(&cuda_out, sizeof(unsigned long long)));
-            CU_SAFE_CALL(cudaMemcpy(cuda_tot, tot.data() + range_start * 3, sizeof(int) * span * 3, cudaMemcpyHostToDevice));
-            CU_SAFE_CALL(cudaMemset(cuda_partial_sum, 0, sizeof(long long) * span));
-            CU_SAFE_CALL(cudaMemset(cuda_out, 0, sizeof(unsigned long long)));
-
-            dim3 dimBlock(CU1DBLOCK);
-            dim3 dimGrid(grid_size);
-            if (kernel_version == 5) {
-                n_queens_v5<<<dimGrid, dimBlock>>>(N, cuda_tot, cuda_partial_sum, span, d_counter);
-            } else if (kernel_version == 4) {
-                n_queens_v4<<<dimGrid, dimBlock>>>(N, cuda_tot, cuda_partial_sum, span, d_counter);
-            } else {
-                n_queens<<<dimGrid, dimBlock>>>(N, cuda_tot, cuda_partial_sum, span, d_counter);
-            }
-            cudaError_t err = cudaDeviceSynchronize();
-            if (err != cudaSuccess) {
-                printf("kernel error: %s\n", cudaGetErrorString(err));
-                exit(-1);
-            }
-
-            reduce_partial<<<256, 256>>>(cuda_partial_sum, span, cuda_out);
-            unsigned long long dev_sum = 0;
-            CU_SAFE_CALL(cudaMemcpy(&dev_sum, cuda_out, sizeof(unsigned long long), cudaMemcpyDeviceToHost));
-            gpu_sum[idx] = (long long)dev_sum;
-
-            CU_SAFE_CALL(cudaFree(cuda_tot));
-            CU_SAFE_CALL(cudaFree(cuda_partial_sum));
-            CU_SAFE_CALL(cudaFree(cuda_out));
-            gettimeofday(&t1, NULL);
-            print_with_time("gpu [%d] finish job: contribution %lld, %.2fms.\n",
-                            idx, gpu_sum[idx], time_diff_ms(t0, t1));
-        }
-
-        CU_SAFE_CALL(cudaFreeHost(h_counter));
-        for (int i = 0; i < gpu_num; i++) {
-            sum += gpu_sum[i] * 2;
-        }
-        return sum;
-    }
-
     if (chunk_sched) {
-        // Dynamic scheduler: GPUs pull fixed-size chunks from a shared queue until
-        // the range is exhausted. Removes the tail imbalance of the static split
-        // (the Q(27) run lost ~18% wall clock to it) and adapts to heterogeneous GPUs.
+        // Guided self-scheduling: GPUs pull chunks sized max(remaining/(2*G),
+        // min_chunk) from a host-side atomic queue. Early chunks are large
+        // (few launches, deep in-kernel dynamic balancing), the tail is
+        // bounded by one small chunk. Removes the tail imbalance of the
+        // static split (the Q(27) run lost ~18% wall clock to it) and adapts
+        // to heterogeneous GPUs.
         long long span = range_end - range_start;
-        long long chunk;
+        long long min_chunk;
         const char *cenv = getenv("NQ_CHUNK");
         if (cenv) {
-            chunk = atoll(cenv);
+            min_chunk = atoll(cenv);
         } else {
-            chunk = span / (gpu_num * 24) + 1;
-            if (chunk < 65536) chunk = 65536;
-            if (chunk > 8388608) chunk = 8388608;
+            min_chunk = 262144;
         }
+        long long max_take = span / (2 * gpu_num) + 1;
+        if (max_take < min_chunk) max_take = min_chunk;
 
         vector<long long> gpu_sum(gpu_num, 0);
         std::atomic<long long> next_start(range_start);
@@ -531,19 +467,30 @@ long long cuda_n_queens(int N, int rows, long long range_start, long long range_
             int *cuda_tot;
             long long *cuda_partial_sum;
             unsigned long long *cuda_counter;
-            CU_SAFE_CALL(cudaMalloc(&cuda_tot, sizeof(int) * chunk * 3));
-            CU_SAFE_CALL(cudaMalloc(&cuda_partial_sum, sizeof(long long) * chunk));
+            unsigned long long *cuda_out;
+            CU_SAFE_CALL(cudaMalloc(&cuda_tot, sizeof(int) * max_take * 3));
+            CU_SAFE_CALL(cudaMalloc(&cuda_partial_sum, sizeof(long long) * max_take));
             CU_SAFE_CALL(cudaMalloc(&cuda_counter, sizeof(unsigned long long)));
-            vector<long long> host_partial(chunk);
+            CU_SAFE_CALL(cudaMalloc(&cuda_out, sizeof(unsigned long long)));
+            CU_SAFE_CALL(cudaMemset(cuda_out, 0, sizeof(unsigned long long)));
 
             long long done = 0;
             int nchunks = 0;
 
             while (true) {
-                long long s = next_start.fetch_add(chunk);
+                // grab a guided-size chunk [s, s+take)
+                long long s = next_start.load();
+                long long take = 0;
+                do {
+                    if (s >= range_end) break;
+                    long long remaining = range_end - s;
+                    take = remaining / (2 * gpu_num);
+                    if (take < min_chunk) take = min_chunk;
+                    if (take > remaining) take = remaining;
+                    if (take > max_take) take = max_take;
+                } while (!next_start.compare_exchange_weak(s, s + take));
                 if (s >= range_end) break;
-                long long e = s + chunk < range_end ? s + chunk : range_end;
-                long long c = e - s;
+                long long c = take;
 
                 CU_SAFE_CALL(cudaMemset(cuda_counter, 0, sizeof(unsigned long long)));
                 CU_SAFE_CALL(cudaMemcpy(cuda_tot, tot.data() + s * 3, sizeof(int) * c * 3, cudaMemcpyHostToDevice));
@@ -562,17 +509,19 @@ long long cuda_n_queens(int N, int rows, long long range_start, long long range_
                     exit(-1);
                 }
 
-                CU_SAFE_CALL(cudaMemcpy(host_partial.data(), cuda_partial_sum, sizeof(long long) * c, cudaMemcpyDeviceToHost));
-                for (long long i = 0; i < c; i++) {
-                    gpu_sum[idx] += host_partial[i];
-                }
+                reduce_partial<<<256, 256>>>(cuda_partial_sum, c, cuda_out);
                 done += c;
                 nchunks++;
             }
 
+            unsigned long long dev_sum = 0;
+            CU_SAFE_CALL(cudaMemcpy(&dev_sum, cuda_out, sizeof(unsigned long long), cudaMemcpyDeviceToHost));
+            gpu_sum[idx] = (long long)dev_sum;
+
             CU_SAFE_CALL(cudaFree(cuda_tot));
             CU_SAFE_CALL(cudaFree(cuda_partial_sum));
             CU_SAFE_CALL(cudaFree(cuda_counter));
+            CU_SAFE_CALL(cudaFree(cuda_out));
             gettimeofday(&t1, NULL);
             print_with_time("gpu [%d] finish job: %d chunks, %lld subproblems, %.2fms.\n",
                             idx, nchunks, done, time_diff_ms(t0, t1));
