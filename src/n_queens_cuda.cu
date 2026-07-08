@@ -216,6 +216,83 @@ __global__ void n_queens_v4(int N, int *tot, long long *partial_sum, long long c
     }
 }
 
+// v5: v1 with two predication-only micro-opts (control flow stays uniform):
+// the exhausted-level write-back is skipped, and the solution count uses a
+// predicated 64-bit add instead of selp+add.
+__global__ void n_queens_v5(int N, int *tot, long long *partial_sum, long long cnt, unsigned long long *sys_counter) {
+    unsigned long long tid = fetch_task(sys_counter);
+    const int last = (1 << N) - 1;
+
+    while (tid < cnt) {
+        long long sum = 0;
+        int bottom = ((threadIdx.x / 32) * 32 * STACKSIZE + threadIdx.x % 32) << 4;
+        int cur = tot[tid * 3];
+        int left = tot[tid * 3 + 1];
+        int right = tot[tid * 3 + 2];
+        int valid_pos = last & ~cur & ~left & ~right;
+
+        if(valid_pos == 0) {
+            tid = fetch_task(sys_counter);
+            continue;
+        }
+
+        asm(".reg .s32 top, tmp, tmp2;\n\t"
+            ".reg .s64 ltmp;\n\t"
+            ".reg .pred p, q, z;\n\t"
+            ".shared .align 16 .b8 stack5[" NQ_STR(STACKBYTES) "];\n\t"
+
+            " mov.u32 top, %5;\n\t"
+            " mov.u32 tmp, stack5;\n\t"
+            " add.s32 %5, %5, tmp;\n\t"
+            " add.s32 top, top, tmp;\n\t"
+
+            " st.shared.v4.u32 [top], {%1, %2, %3, %4};\n\t"                // stack[top] = {cur, left, right, valid_pos}
+            " add.s32 top, top, 512;\n\t"                                   // top += 512
+
+            " LOOP5:\n\t"
+            " setp.eq.s32 p, top, %5;\n\t"                                  // top == bottom
+            " @p bra FINISH5;\n\t"                                           // done
+
+            " ld.shared.v4.u32 {%1, %2, %3, %4}, [top + -512];\n\t"         // {cur, left, right, valid_pos} = stack[top - 512]
+            " neg.s32 tmp, %4;\n\t"                                         // p = -valid_pos
+            " and.b32 tmp, %4, tmp;\n\t"                                    // p = valid_pos & (-valid_pos)
+            " sub.s32 %4, %4, tmp;\n\t"                                     // valid_pos -= p
+            " setp.eq.s32 p, %4, 0;\n\t"                                    // p = (valid_pos == 0)
+            " @!p st.shared.s32 [top + -500], %4;\n\t"                      // write back only if level still live
+            " selp.b32 tmp2, 512, 0, p;\n\t"                                // tmp = (p == 1 ? 512 : 0)
+            " sub.s32 top, top, tmp2;\n\t"                                  // top -= 512
+
+            " or.b32 %1, %1, tmp;\n\t"                                      // cur = cur | p
+            " or.b32 %2, %2, tmp;\n\t"                                      // left = left | p
+            " shl.b32 %2, %2, 1;\n\t"                                       // left = left << 1
+            " or.b32 %3, %3, tmp;\n\t"                                      // right = right | p
+            " shr.b32 %3, %3, 1;\n\t"                                       // right = right >> 1
+            " lop3.b32 tmp, %1, %2, %3, 0x1;\n\t"                           // tmp = ~cur & ~left & ~right;
+            " and.b32 %4, %6, tmp;\n\t"                                     // valid_pos = last & tmp
+            " popc.b32 tmp, %1;\n\t"                                        // tmp = popc(cur)
+            " setp.eq.s32 p, tmp, %7;\n\t"                                  // popc(cur) == N - 1
+            " setp.eq.s32 q, %4, 0;\n\t"                                    // valid_pos == 0
+            " or.pred z, p, q;\n\t"                                         // valid_pos == 0 || popc(cur) == N - 1
+
+            " popc.b32 tmp, %4;\n\t"                                        // tmp = popc(valid_pos)
+            " cvt.s64.s32 ltmp, tmp;\n\t"                                   // s32 -> s64
+            " @z add.s64 %0, %0, ltmp;\n\t"                                 // sum += popc(valid_pos) at leaves/dead ends
+
+            " @!z st.shared.v4.u32 [top], {%1, %2, %3, %4};\n\t"            // stack[top] = {cur, left, right, valid_pos}
+            " selp.b32 tmp, 0, 512, z;\n\t"                                 // tmp = (z == 1 ? 0 : 512)
+            " add.s32 top, top, tmp;\n\t"                                   // top += 512
+            " bra.uni LOOP5;\n\t"
+
+            " FINISH5:\n\t"
+            :"+l"(sum), "+r"(cur), "+r"(left), "+r"(right), "+r"(valid_pos), "+r"(bottom)  // output
+            :"r"(last), "r"(N - 1)                                          // input
+        );
+
+        partial_sum[tid] = sum;
+        tid = fetch_task(sys_counter);
+    }
+}
+
 __global__ void n_queens(int N, int *tot, long long *partial_sum, long long cnt, unsigned long long *sys_counter) {
     unsigned long long tid = fetch_task(sys_counter);
     const int last = (1 << N) - 1;
@@ -392,7 +469,9 @@ long long cuda_n_queens(int N, int rows, long long range_start, long long range_
 
             dim3 dimBlock(CU1DBLOCK);
             dim3 dimGrid(grid_size);
-            if (kernel_version == 4) {
+            if (kernel_version == 5) {
+                n_queens_v5<<<dimGrid, dimBlock>>>(N, cuda_tot, cuda_partial_sum, span, d_counter);
+            } else if (kernel_version == 4) {
                 n_queens_v4<<<dimGrid, dimBlock>>>(N, cuda_tot, cuda_partial_sum, span, d_counter);
             } else {
                 n_queens<<<dimGrid, dimBlock>>>(N, cuda_tot, cuda_partial_sum, span, d_counter);
@@ -566,7 +645,9 @@ long long cuda_n_queens(int N, int rows, long long range_start, long long range_
         dim3 dimBlock(CU1DBLOCK);
         dim3 dimGrid(grid_size);
 
-        if (kernel_version == 4) {
+        if (kernel_version == 5) {
+            n_queens_v5<<<dimGrid, dimBlock>>>(N, cuda_tot, cuda_partial_sum, cnt, cuda_counter);
+        } else if (kernel_version == 4) {
             n_queens_v4<<<dimGrid, dimBlock>>>(N, cuda_tot, cuda_partial_sum, cnt, cuda_counter);
         } else if (kernel_version == 2) {
             n_queens_v2<<<dimGrid, dimBlock>>>(N, cuda_tot, cuda_partial_sum, cnt);
