@@ -1,0 +1,28 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(zerotier-cli status:*)",
+      "Bash(sudo zerotier-cli:*)",
+      "Bash(ping:*)",
+      "mcp__bcm-cluster__cluster_exec",
+      "Bash(zerotier-cli listnetworks:*)",
+      "Bash(/opt/anaconda3/bin/python:*)",
+      "Bash(system_profiler:*)",
+      "Bash(ioreg:*)",
+      "Bash(pip install:*)",
+      "Bash(python:*)",
+      "Bash(ls:*)",
+      "WebSearch",
+      "WebFetch(domain:arxiv.org)",
+      "WebFetch(domain:en.wikipedia.org)",
+      "Bash(curl:*)",
+      "Bash(pdftotext:*)",
+      "Bash(kill:*)",
+      "Bash(pkill:*)",
+      "Bash(lsof:*)",
+      "Bash(python3:*)",
+      "Bash(chmod:*)",
+      "Bash(tree:*)"
+    ]
+  }
+}

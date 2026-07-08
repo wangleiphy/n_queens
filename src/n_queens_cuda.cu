@@ -1,11 +1,96 @@
 #include <cuda_runtime.h>
 #include <omp.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include <atomic>
 
 #include "macro.h"
 #include "n_queens.h"
 #include "utils.h"
 
 __device__ unsigned long long global_counter = 0;
+
+// v2: register-cached top-of-stack. The current DFS level lives in registers
+// (cur,left,right,valid_pos); shared memory is only touched when descending
+// past a level that still has remaining choices (push) or when backtracking
+// (pop). Levels with no remaining choices are never pushed, so every pop
+// yields a level with work. Visits the same tree as v1 in the same order.
+__global__ void n_queens_v2(int N, int *tot, long long *partial_sum, long long cnt) {
+    unsigned long long tid = atomicAdd(&global_counter, 1);
+    const int last = (1 << N) - 1;
+
+    while (tid < cnt) {
+        long long sum = 0;
+        int bottom = ((threadIdx.x / 32) * 32 * STACKSIZE + threadIdx.x % 32) << 4;
+        int cur = tot[tid * 3];
+        int left = tot[tid * 3 + 1];
+        int right = tot[tid * 3 + 2];
+        int valid_pos = last & ~cur & ~left & ~right;
+
+        if(valid_pos == 0) {
+            tid = atomicAdd(&global_counter, 1);
+            continue;
+        }
+
+        asm(".reg .s32 top, p, cc, ll, rr, vv, tmp;\n\t"
+            ".reg .s64 ltmp;\n\t"
+            ".reg .pred pz, pq, pe, z;\n\t"
+            ".shared .align 16 .b8 stack2[49152];\n\t"
+
+            " mov.u32 tmp, stack2;\n\t"
+            " add.s32 %5, %5, tmp;\n\t"                                     // bottom += stack base
+            " mov.u32 top, %5;\n\t"                                         // top = bottom (empty stack)
+
+            " LOOP2:\n\t"
+            " neg.s32 p, %4;\n\t"                                           // p = -v0
+            " and.b32 p, p, %4;\n\t"                                        // p = v0 & -v0
+            " sub.s32 %4, %4, p;\n\t"                                       // v0 -= p
+            " or.b32  cc, %1, p;\n\t"                                       // cc = c0 | p
+            " or.b32  ll, %2, p;\n\t"
+            " shl.b32 ll, ll, 1;\n\t"                                       // ll = (l0 | p) << 1
+            " or.b32  rr, %3, p;\n\t"
+            " shr.b32 rr, rr, 1;\n\t"                                       // rr = (r0 | p) >> 1
+            " lop3.b32 tmp, cc, ll, rr, 0x1;\n\t"                           // ~cc & ~ll & ~rr
+            " and.b32 vv, tmp, %6;\n\t"                                     // vv = last & tmp
+            " popc.b32 tmp, cc;\n\t"
+            " setp.eq.s32 pz, tmp, %7;\n\t"                                 // popc(cc) == N - 1
+            " setp.eq.s32 pq, vv, 0;\n\t"                                   // vv == 0
+            " or.pred z, pz, pq;\n\t"                                       // leaf or dead end
+            " @z bra ZPATH;\n\t"
+
+            // descend: push current level if it still has choices, child -> regs
+            " setp.ne.s32 pq, %4, 0;\n\t"                                   // v0 != 0
+            " @pq st.shared.v4.u32 [top], {%1, %2, %3, %4};\n\t"            // push {c0,l0,r0,v0}
+            " @pq add.s32 top, top, 512;\n\t"
+            " mov.b32 %1, cc;\n\t"
+            " mov.b32 %2, ll;\n\t"
+            " mov.b32 %3, rr;\n\t"
+            " mov.b32 %4, vv;\n\t"
+            " bra.uni LOOP2;\n\t"
+
+            " ZPATH:\n\t"                                                   // count solutions (0 if dead end)
+            " popc.b32 tmp, vv;\n\t"
+            " cvt.s64.s32 ltmp, tmp;\n\t"
+            " add.s64 %0, %0, ltmp;\n\t"                                    // sum += popc(vv)
+            " setp.ne.s32 pq, %4, 0;\n\t"
+            " @pq bra.uni LOOP2;\n\t"                                       // same level still has choices
+            " setp.eq.s32 pe, top, %5;\n\t"
+            " @pe bra FINISH2;\n\t"                                         // stack empty -> done
+            " sub.s32 top, top, 512;\n\t"
+            " ld.shared.v4.u32 {%1, %2, %3, %4}, [top];\n\t"                // pop (always has choices)
+            " bra.uni LOOP2;\n\t"
+
+            " FINISH2:\n\t"
+            :"+l"(sum), "+r"(cur), "+r"(left), "+r"(right), "+r"(valid_pos), "+r"(bottom)  // output
+            :"r"(last), "r"(N - 1)                                          // input
+        );
+
+        partial_sum[tid] = sum;
+        tid = atomicAdd(&global_counter, 1);
+    }
+}
+
 __global__ void n_queens(int N, int *tot, long long *partial_sum, long long cnt) {
     unsigned long long tid = atomicAdd(&global_counter, 1);
     const int last = (1 << N) - 1;
@@ -81,7 +166,7 @@ __global__ void n_queens(int N, int *tot, long long *partial_sum, long long cnt)
     }
 }
 
-long long cuda_n_queens(int N, int rows) {
+long long cuda_n_queens(int N, int rows, long long range_start, long long range_end) {
     struct timeval start, end;
     long long sum = 0;
     vector<int> tot;
@@ -100,11 +185,119 @@ long long cuda_n_queens(int N, int rows) {
 
     print_with_time("Use %.2fms to generate %lld subproblems!\n", time_diff_ms(start, end), cnt);
 
+    // optional subproblem range [range_start, range_end) for multi-node sharding;
+    // outputs of disjoint ranges covering [0, cnt) sum to the full count.
+    if (range_end < 0 || range_end > cnt) range_end = cnt;
+    if (range_start < 0) range_start = 0;
+    if (range_start > range_end) range_start = range_end;
+    bool has_range = (range_start != 0 || range_end != cnt);
+    if (has_range) {
+        print_with_time("processing subproblem range [%lld, %lld) of %lld\n", range_start, range_end, cnt);
+    }
+
     int gpu_num = 0;
     cudaGetDeviceCount(&gpu_num);
     if (gpu_num == 0) {
         printf("Failed to find any gpu!\n");
         return -1;
+    }
+
+    // kernel version, grid size and scheduler are runtime-selectable for A/B experiments
+    const char *kenv = getenv("NQ_KERNEL");
+    int kernel_version = kenv ? atoi(kenv) : 1;
+    const char *genv = getenv("NQ_GRID");
+    int grid_size = genv ? atoi(genv) : 1024;
+    const char *senv = getenv("NQ_SCHED");
+    bool dynamic_sched = has_range || (senv && strcmp(senv, "dynamic") == 0);
+
+    {
+        int maxb1 = 0, maxb2 = 0;
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &maxb1, static_cast<void (*)(int, int *, long long *, long long)>(n_queens), CU1DBLOCK, 0);
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&maxb2, n_queens_v2, CU1DBLOCK, 0);
+        print_with_time("kernel=v%d grid=%d block=%d sched=%s occupancy: v1 %d blocks/SM, v2 %d blocks/SM\n",
+                        kernel_version, grid_size, CU1DBLOCK, dynamic_sched ? "dynamic" : "static",
+                        maxb1, maxb2);
+    }
+
+    if (dynamic_sched) {
+        // Dynamic scheduler: GPUs pull fixed-size chunks from a shared queue until
+        // the range is exhausted. Removes the tail imbalance of the static split
+        // (the Q(27) run lost ~18% wall clock to it) and adapts to heterogeneous GPUs.
+        long long span = range_end - range_start;
+        long long chunk;
+        const char *cenv = getenv("NQ_CHUNK");
+        if (cenv) {
+            chunk = atoll(cenv);
+        } else {
+            chunk = span / (gpu_num * 24) + 1;
+            if (chunk < 65536) chunk = 65536;
+            if (chunk > 8388608) chunk = 8388608;
+        }
+
+        vector<long long> gpu_sum(gpu_num, 0);
+        std::atomic<long long> next_start(range_start);
+
+#pragma omp parallel num_threads(gpu_num)
+        {
+            int idx = omp_get_thread_num();
+            CU_SAFE_CALL(cudaSetDevice(idx));
+
+            struct timeval t0, t1;
+            gettimeofday(&t0, NULL);
+
+            int *cuda_tot;
+            long long *cuda_partial_sum;
+            CU_SAFE_CALL(cudaMalloc(&cuda_tot, sizeof(int) * chunk * 3));
+            CU_SAFE_CALL(cudaMalloc(&cuda_partial_sum, sizeof(long long) * chunk));
+            vector<long long> host_partial(chunk);
+
+            long long done = 0;
+            int nchunks = 0;
+            const unsigned long long zero = 0;
+
+            while (true) {
+                long long s = next_start.fetch_add(chunk);
+                if (s >= range_end) break;
+                long long e = s + chunk < range_end ? s + chunk : range_end;
+                long long c = e - s;
+
+                CU_SAFE_CALL(cudaMemcpyToSymbol(global_counter, &zero, sizeof(zero)));
+                CU_SAFE_CALL(cudaMemcpy(cuda_tot, tot.data() + s * 3, sizeof(int) * c * 3, cudaMemcpyHostToDevice));
+                CU_SAFE_CALL(cudaMemset(cuda_partial_sum, 0, sizeof(long long) * c));
+
+                dim3 dimBlock(CU1DBLOCK);
+                dim3 dimGrid(grid_size);
+                if (kernel_version == 2) {
+                    n_queens_v2<<<dimGrid, dimBlock>>>(N, cuda_tot, cuda_partial_sum, c);
+                } else {
+                    n_queens<<<dimGrid, dimBlock>>>(N, cuda_tot, cuda_partial_sum, c);
+                }
+                cudaError_t err = cudaDeviceSynchronize();
+                if (err != cudaSuccess) {
+                    printf("kernel error: %s\n", cudaGetErrorString(err));
+                    exit(-1);
+                }
+
+                CU_SAFE_CALL(cudaMemcpy(host_partial.data(), cuda_partial_sum, sizeof(long long) * c, cudaMemcpyDeviceToHost));
+                for (long long i = 0; i < c; i++) {
+                    gpu_sum[idx] += host_partial[i];
+                }
+                done += c;
+                nchunks++;
+            }
+
+            CU_SAFE_CALL(cudaFree(cuda_tot));
+            CU_SAFE_CALL(cudaFree(cuda_partial_sum));
+            gettimeofday(&t1, NULL);
+            print_with_time("gpu [%d] finish job: %d chunks, %lld subproblems, %.2fms.\n",
+                            idx, nchunks, done, time_diff_ms(t0, t1));
+        }
+
+        for (int i = 0; i < gpu_num; i++) {
+            sum += gpu_sum[i] * 2;
+        }
+        return sum;
     }
 
     // 2. divide total subproblems to different trunks
@@ -162,9 +355,13 @@ long long cuda_n_queens(int N, int rows) {
         CU_SAFE_CALL(cudaMemset(cuda_partial_sum, 0, sizeof(long long) * cnt));
 
         dim3 dimBlock(CU1DBLOCK);
-        dim3 dimGrid(1024);
+        dim3 dimGrid(grid_size);
 
-        n_queens<<<dimGrid, dimBlock>>>(N, cuda_tot, cuda_partial_sum, cnt);
+        if (kernel_version == 2) {
+            n_queens_v2<<<dimGrid, dimBlock>>>(N, cuda_tot, cuda_partial_sum, cnt);
+        } else {
+            n_queens<<<dimGrid, dimBlock>>>(N, cuda_tot, cuda_partial_sum, cnt);
+        }
 
         cudaError_t err = cudaDeviceSynchronize();
         if (err != cudaSuccess) {

@@ -6,6 +6,11 @@
 #include "utils.h"
 
 int main(int argc, char *argv[]) {
+    if (argc < 3) {
+        printf("usage: %s N pre_placed_rows [range_start range_end]\n", argv[0]);
+        return -1;
+    }
+
     int N = atoi(argv[1]);
     if (N < 2 || N > 28) {
         printf("Not allowed %d queens problem!\n", N);
@@ -28,6 +33,12 @@ int main(int argc, char *argv[]) {
         rows = 2;
     }
 
+    long long range_start = 0, range_end = -1;
+    if (argc >= 5) {
+        range_start = atoll(argv[3]);
+        range_end = atoll(argv[4]);
+    }
+
     long long sum = 0;
 
     struct timeval start, end;
@@ -48,7 +59,7 @@ int main(int argc, char *argv[]) {
 
     print_with_time("===============================================================\n");
     gettimeofday(&start, NULL);
-    sum = cuda_n_queens(N, rows);
+    sum = cuda_n_queens(N, rows, range_start, range_end);
     gettimeofday(&end, NULL);
     print_with_time("cuda %d queens result %lld, calc time: [%.2fms]\n", N, sum, time_diff_ms(start, end));
     print_with_time("===============================================================\n");

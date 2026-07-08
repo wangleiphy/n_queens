@@ -16,4 +16,7 @@ long long serial_n_queens(int N, int rows);
 
 long long parallel_n_queens(int N, int rows);
 
-long long cuda_n_queens(int N, int rows);
+// range_start/range_end select a subproblem range [range_start, range_end) for
+// multi-node sharding; range_end = -1 means "to the end". Outputs of disjoint
+// ranges covering [0, cnt) sum to the full count.
+long long cuda_n_queens(int N, int rows, long long range_start = 0, long long range_end = -1);
