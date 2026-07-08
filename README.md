@@ -47,15 +47,21 @@ All runs verified against exact counts (OEIS A000170).
 
 | Config | N=20 | N=21 | N=22 |
 |---|---:|---:|---:|
-| CONFIG1 | 3.14 s | 24.0 s | 205 s |
-| CONFIG2 | 2.69 s | 20.8 s | (pending) |
-| CONFIG3 | 2.39 s | 18.1 s | (pending) |
-| CONFIG7 | (pending) | 21.9 s | 187 s |
+| CONFIG1 | 3.16 s | 24.0 s | 205 s |
+| CONFIG2 | 2.69 s | 20.8 s | 178 s |
+| CONFIG3 | 2.43 s | 18.1 s | 159 s |
+| CONFIG7 | 2.93 s | 21.9 s | 186 s |
 
-CONFIG3 is ~13% faster than CONFIG2 where its stack depth suffices (N ≤ 23 at
-rows=6). For N up to 28, CONFIG7 replaces CONFIG1 and is ~9% faster than it.
-`rows=6` beat both `rows=5` (+2% at N=21) and `rows=7` (+9% at N=21) in
+CONFIG3 is 11–13% faster than CONFIG2 where its stack depth suffices (N ≤ 23
+at rows=6). For N up to 28, CONFIG7 replaces CONFIG1 and is ~9% faster than
+it. `rows=6` beat both `rows=5` (+2% at N=21) and `rows=7` (+9% at N=21) in
 direct tests.
+
+Multi-GPU (3× RTX 5090, chunk scheduler, rows=6): N=22 in 58.9 s, N=23 in
+534 s (CONFIG3), all counts exact through Q(23) = 24,233,937,684,440.
+At N=23 with CONFIG7 the chunk scheduler beat the static split by **10.3%**
+(648 s vs 722 s; the static run idled GPUs for 5.3 of its 12 minutes) —
+consistent with the ~12% idle tail visible in the upstream Q(27) log.
 
 ## Multi-node sharding for very large N
 
@@ -144,6 +150,19 @@ Optimization attempts on the kernel itself, all rejected by measurement
   reason. The kernel's speed comes from its fully predicated, uniform loop.
 * Predication-only micro-opts (skip dead write-back, predicated 64-bit add):
   ±1%, not worth the code.
+* Exact closed-form count of the two last rows,
+  `popc(v)·popc(M) − popc(M&v) − popc(M&(v<<1)) − popc(M&(v>>1))`
+  (verified for N=5…15): correct but 40–90% slower as a kernel. The search
+  tree is **middle-heavy** — the deepest level holds only ~13% of walked
+  nodes, so leaf tricks tax the fat middle levels for a small saving.
+* Exact state deduplication (transposition folding, incl. mirror
+  canonicalization): measured collapse ≤ 1.07 even at 62% board depth and
+  shrinking with N — no headroom.
+* Extra board symmetries (180°/row-flip, 8-fold): in a row-sequential DFS
+  their canonical constraints only bind at the last row (no pruning), and
+  orderings that make them prune (middle-out/bidirectional) double the
+  per-node mask state, costing more occupancy than the ×2 tree reduction
+  is worth on a GPU (net ≈1.1–1.3×).
 * One host-pinned task counter shared across GPUs via `atomicAdd_system`:
   **silently wrong** on PCIe nodes (duplicated task ids ⇒ inflated counts).
   The guided-chunk queue replaced it.

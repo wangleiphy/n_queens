@@ -119,14 +119,28 @@ completions = popc(v)·popc(M) − popc(M&v) − popc(M&(v<<1)) − popc(M&(v>>1
 
 Each placement `p` (single bit) removes exactly the cells `p, p<<1, p>>1`
 from `M`, and the cross-terms decompose bit-by-bit. Verified exhaustively vs
-plain DFS for N=5…15 (`src/closed2_check.cpp`). Consequences: the deepest
-walked tree level (~60% of nodes) disappears; the arithmetic is straight-line
-(17 ops, no loop → no v4-style divergence); stack depth requirement drops to
-N−rows−2, so CONFIG3 becomes legal at N=24/rows=6. Two kernel variants under
-test: v6 (fully predicated) and v7 (short fixed-length branch).
-A three-row closed form was analyzed and rejected: the cross-terms become
-products of p-dependent popcounts (~70 ops for another ×2 tree shrink —
-net loss vs v6's ~46 ops/node).
+plain DFS for N=5…15 (`src/closed2_check.cpp`). Implemented as kernel v6
+(fully predicated) and v7 (short fixed-length branch).
+
+**Measured (5090, N=21 rows=6): v1 18.0 s / 22.3 s (c3/c7); v6 25.2 / 30.7;
+v7 32.9 / 41.8. Correct everywhere, 40–90% slower — rejected.** The failure
+exposes the decisive fact about this search tree: it is **middle-heavy**.
+Eliminating the deepest walked level removed only ~13% of iterations (implied
+by the timings), not the ~60% a "leaves dominate" intuition predicts — most
+branches die in the middle rows, so the deepest levels are nearly empty while
+the +17 predicated ops tax every fat middle-level node. v7 also shows that
+even a rarely-taken branch loses: one diverging lane drags the whole warp.
+A three-row closed form was analyzed and rejected on top of this: cross-terms
+become products of p-dependent popcounts (~70 ops for another ×2 shrink of an
+already thin level).
+
+**Final conclusion of the algorithmic round:** seven kernel/algorithm
+restructurings were implemented or probed and all measured negative (v2, v4,
+v5, v6, v7, two dedup schemes), and the symmetry analysis shows ≤1.3× net on
+GPU. The upstream kernel is at a genuine local optimum for this formulation;
+the realized, verified wins are configuration occupancy (CONFIG3/CONFIG7),
+guided-chunk scheduling (10.3% measured at N=23 on 3 GPUs; ~12% on the Q(27)
+log), and multi-node sharding with checkpointing (linear scale-out).
 
 **Symmetry beyond mirror — analyzed, not implemented (net ~1.1–1.3×).** The
 Klein group {id, column-mirror, row-flip, 180°} acts on solutions with
