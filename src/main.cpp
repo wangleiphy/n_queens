@@ -18,8 +18,13 @@ int main(int argc, char *argv[]) {
     }
 
     int rows = atoi(argv[2]);
-    if(STACKSIZE + 1 + rows < N) {
-        printf("This configure cannot process %d-queens with pre-placing %d rows. Pre-placed rows should be >= %d.\n", N, rows, N - STACKSIZE - 1);
+    // closed-form kernels (NQ_KERNEL=6/7) never push the two deepest levels,
+    // so they need one stack level less than the baseline kernel
+    const char *kenv = getenv("NQ_KERNEL");
+    int kv = kenv ? atoi(kenv) : 1;
+    int depth_slack = (kv >= 6 && N - rows >= 3) ? 2 : 1;
+    if(STACKSIZE + depth_slack + rows < N) {
+        printf("This configure cannot process %d-queens with pre-placing %d rows. Pre-placed rows should be >= %d.\n", N, rows, N - STACKSIZE - depth_slack);
         return -1;
     }
 
