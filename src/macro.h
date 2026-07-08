@@ -51,10 +51,10 @@
 #define STACKSIZE 20
 #define STACKBYTES 40960
 #elif defined _USE_CONFIG7_
-// Q(28)-capable with v4: 96 threads, 3 blocks/SM (288 thr/SM)
+// Q(28)-capable with v1 at rows=6 (depth 21): 96 threads, 3 blocks/SM (288 thr/SM)
 #define CU1DBLOCK 96
-#define STACKSIZE 20
-#define STACKBYTES 30720
+#define STACKSIZE 21
+#define STACKBYTES 32256
 #endif
 
 // stringify helper so the per-config stack size can appear inside inline PTX

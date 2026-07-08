@@ -11,6 +11,23 @@
 
 __device__ unsigned long long global_counter = 0;
 
+// Task fetch: either the per-GPU device counter (sys_counter == NULL) or a
+// host-pinned counter shared by all GPUs of the node (queue scheduler), one
+// system-scope atomic per subproblem.
+__device__ __forceinline__ unsigned long long fetch_task(unsigned long long *sys_counter) {
+    return sys_counter ? atomicAdd_system(sys_counter, 1ULL) : atomicAdd(&global_counter, 1ULL);
+}
+
+// Sums partial_sum[0..n) into *out (device memory, pre-zeroed).
+__global__ void reduce_partial(const long long *v, long long n, unsigned long long *out) {
+    long long acc = 0;
+    for (long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x; i < n;
+         i += (long long)gridDim.x * blockDim.x) {
+        acc += v[i];
+    }
+    atomicAdd(out, (unsigned long long)acc);
+}
+
 // v2: register-cached top-of-stack. The current DFS level lives in registers
 // (cur,left,right,valid_pos); shared memory is only touched when descending
 // past a level that still has remaining choices (push) or when backtracking
@@ -98,8 +115,8 @@ __global__ void n_queens_v2(int N, int *tot, long long *partial_sum, long long c
 // iteration incl. a shared-memory round trip on each; here they cost ~14
 // issue slots and no shared traffic. Stack depth requirement drops to
 // N - rows - 2. Otherwise identical to v1 (same tree, same order).
-__global__ void n_queens_v4(int N, int *tot, long long *partial_sum, long long cnt) {
-    unsigned long long tid = atomicAdd(&global_counter, 1);
+__global__ void n_queens_v4(int N, int *tot, long long *partial_sum, long long cnt, unsigned long long *sys_counter) {
+    unsigned long long tid = fetch_task(sys_counter);
     const int last = (1 << N) - 1;
 
     while (tid < cnt) {
@@ -111,7 +128,7 @@ __global__ void n_queens_v4(int N, int *tot, long long *partial_sum, long long c
         int valid_pos = last & ~cur & ~left & ~right;
 
         if(valid_pos == 0) {
-            tid = atomicAdd(&global_counter, 1);
+            tid = fetch_task(sys_counter);
             continue;
         }
 
@@ -193,12 +210,12 @@ __global__ void n_queens_v4(int N, int *tot, long long *partial_sum, long long c
         );
 
         partial_sum[tid] = sum;
-        tid = atomicAdd(&global_counter, 1);
+        tid = fetch_task(sys_counter);
     }
 }
 
-__global__ void n_queens(int N, int *tot, long long *partial_sum, long long cnt) {
-    unsigned long long tid = atomicAdd(&global_counter, 1);
+__global__ void n_queens(int N, int *tot, long long *partial_sum, long long cnt, unsigned long long *sys_counter) {
+    unsigned long long tid = fetch_task(sys_counter);
     const int last = (1 << N) - 1;
 
     while (tid < cnt) {
@@ -210,7 +227,7 @@ __global__ void n_queens(int N, int *tot, long long *partial_sum, long long cnt)
         int valid_pos = last & ~cur & ~left & ~right;
 
         if(valid_pos == 0) {
-            tid = atomicAdd(&global_counter, 1);
+            tid = fetch_task(sys_counter);
             continue;
         }
 
@@ -268,7 +285,7 @@ __global__ void n_queens(int N, int *tot, long long *partial_sum, long long cnt)
         );
 
         partial_sum[tid] = sum;
-        tid = atomicAdd(&global_counter, 1);
+        tid = fetch_task(sys_counter);
     }
 }
 
@@ -290,6 +307,12 @@ long long cuda_n_queens(int N, int rows, long long range_start, long long range_
     gettimeofday(&end, NULL);
 
     print_with_time("Use %.2fms to generate %lld subproblems!\n", time_diff_ms(start, end), cnt);
+
+    // shard drivers use this to size ranges without running the solve
+    if (getenv("NQ_COUNT_ONLY")) {
+        printf("TOTAL_SUBPROBLEMS %lld\n", cnt);
+        exit(0);
+    }
 
     // optional subproblem range [range_start, range_end) for multi-node sharding;
     // outputs of disjoint ranges covering [0, cnt) sum to the full count.
@@ -313,20 +336,92 @@ long long cuda_n_queens(int N, int rows, long long range_start, long long range_
     int kernel_version = kenv ? atoi(kenv) : 1;
     const char *genv = getenv("NQ_GRID");
     int grid_size = genv ? atoi(genv) : 1024;
+    // NQ_SCHED: "static" (default) = one launch per GPU over a fixed split;
+    // "queue" = one launch per GPU, all GPUs pull tasks from one host-pinned
+    // counter (best balance, default when a range is given); "chunk" = GPUs
+    // pull fixed-size chunks from a host queue (many launches).
     const char *senv = getenv("NQ_SCHED");
-    bool dynamic_sched = has_range || (senv && strcmp(senv, "dynamic") == 0);
+    const char *sched = senv ? senv : (has_range ? "queue" : "static");
+    bool chunk_sched = strcmp(sched, "chunk") == 0 || strcmp(sched, "dynamic") == 0;
+    bool queue_sched = strcmp(sched, "queue") == 0;
 
     {
         int maxb1 = 0, maxb2 = 0;
         cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-            &maxb1, static_cast<void (*)(int, int *, long long *, long long)>(n_queens), CU1DBLOCK, 0);
-        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&maxb2, n_queens_v2, CU1DBLOCK, 0);
-        print_with_time("kernel=v%d grid=%d block=%d sched=%s occupancy: v1 %d blocks/SM, v2 %d blocks/SM\n",
-                        kernel_version, grid_size, CU1DBLOCK, dynamic_sched ? "dynamic" : "static",
+            &maxb1, static_cast<void (*)(int, int *, long long *, long long, unsigned long long *)>(n_queens), CU1DBLOCK, 0);
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&maxb2, n_queens_v4, CU1DBLOCK, 0);
+        print_with_time("kernel=v%d grid=%d block=%d sched=%s occupancy: v1 %d blocks/SM, v4 %d blocks/SM\n",
+                        kernel_version, grid_size, CU1DBLOCK, queue_sched ? "queue" : (chunk_sched ? "chunk" : "static"),
                         maxb1, maxb2);
     }
 
-    if (dynamic_sched) {
+    if (queue_sched) {
+        // One kernel launch per GPU; every task fetch is a system-scope atomic
+        // on a host-pinned counter shared by all GPUs, so the node's GPUs
+        // drain the range together with no static split and no chunk tails.
+        long long span = range_end - range_start;
+        unsigned long long *h_counter;
+        CU_SAFE_CALL(cudaHostAlloc(&h_counter, sizeof(unsigned long long),
+                                   cudaHostAllocPortable | cudaHostAllocMapped));
+        *h_counter = 0;
+
+        vector<long long> gpu_sum(gpu_num, 0);
+
+#pragma omp parallel num_threads(gpu_num)
+        {
+            int idx = omp_get_thread_num();
+            CU_SAFE_CALL(cudaSetDevice(idx));
+
+            struct timeval t0, t1;
+            gettimeofday(&t0, NULL);
+
+            unsigned long long *d_counter;
+            CU_SAFE_CALL(cudaHostGetDevicePointer(&d_counter, h_counter, 0));
+
+            int *cuda_tot;
+            long long *cuda_partial_sum;
+            unsigned long long *cuda_out;
+            CU_SAFE_CALL(cudaMalloc(&cuda_tot, sizeof(int) * span * 3));
+            CU_SAFE_CALL(cudaMalloc(&cuda_partial_sum, sizeof(long long) * span));
+            CU_SAFE_CALL(cudaMalloc(&cuda_out, sizeof(unsigned long long)));
+            CU_SAFE_CALL(cudaMemcpy(cuda_tot, tot.data() + range_start * 3, sizeof(int) * span * 3, cudaMemcpyHostToDevice));
+            CU_SAFE_CALL(cudaMemset(cuda_partial_sum, 0, sizeof(long long) * span));
+            CU_SAFE_CALL(cudaMemset(cuda_out, 0, sizeof(unsigned long long)));
+
+            dim3 dimBlock(CU1DBLOCK);
+            dim3 dimGrid(grid_size);
+            if (kernel_version == 4) {
+                n_queens_v4<<<dimGrid, dimBlock>>>(N, cuda_tot, cuda_partial_sum, span, d_counter);
+            } else {
+                n_queens<<<dimGrid, dimBlock>>>(N, cuda_tot, cuda_partial_sum, span, d_counter);
+            }
+            cudaError_t err = cudaDeviceSynchronize();
+            if (err != cudaSuccess) {
+                printf("kernel error: %s\n", cudaGetErrorString(err));
+                exit(-1);
+            }
+
+            reduce_partial<<<256, 256>>>(cuda_partial_sum, span, cuda_out);
+            unsigned long long dev_sum = 0;
+            CU_SAFE_CALL(cudaMemcpy(&dev_sum, cuda_out, sizeof(unsigned long long), cudaMemcpyDeviceToHost));
+            gpu_sum[idx] = (long long)dev_sum;
+
+            CU_SAFE_CALL(cudaFree(cuda_tot));
+            CU_SAFE_CALL(cudaFree(cuda_partial_sum));
+            CU_SAFE_CALL(cudaFree(cuda_out));
+            gettimeofday(&t1, NULL);
+            print_with_time("gpu [%d] finish job: contribution %lld, %.2fms.\n",
+                            idx, gpu_sum[idx], time_diff_ms(t0, t1));
+        }
+
+        CU_SAFE_CALL(cudaFreeHost(h_counter));
+        for (int i = 0; i < gpu_num; i++) {
+            sum += gpu_sum[i] * 2;
+        }
+        return sum;
+    }
+
+    if (chunk_sched) {
         // Dynamic scheduler: GPUs pull fixed-size chunks from a shared queue until
         // the range is exhausted. Removes the tail imbalance of the static split
         // (the Q(27) run lost ~18% wall clock to it) and adapts to heterogeneous GPUs.
@@ -375,11 +470,11 @@ long long cuda_n_queens(int N, int rows, long long range_start, long long range_
                 dim3 dimBlock(CU1DBLOCK);
                 dim3 dimGrid(grid_size);
                 if (kernel_version == 4) {
-                    n_queens_v4<<<dimGrid, dimBlock>>>(N, cuda_tot, cuda_partial_sum, c);
+                    n_queens_v4<<<dimGrid, dimBlock>>>(N, cuda_tot, cuda_partial_sum, c, NULL);
                 } else if (kernel_version == 2) {
                     n_queens_v2<<<dimGrid, dimBlock>>>(N, cuda_tot, cuda_partial_sum, c);
                 } else {
-                    n_queens<<<dimGrid, dimBlock>>>(N, cuda_tot, cuda_partial_sum, c);
+                    n_queens<<<dimGrid, dimBlock>>>(N, cuda_tot, cuda_partial_sum, c, NULL);
                 }
                 cudaError_t err = cudaDeviceSynchronize();
                 if (err != cudaSuccess) {
@@ -466,11 +561,11 @@ long long cuda_n_queens(int N, int rows, long long range_start, long long range_
         dim3 dimGrid(grid_size);
 
         if (kernel_version == 4) {
-            n_queens_v4<<<dimGrid, dimBlock>>>(N, cuda_tot, cuda_partial_sum, cnt);
+            n_queens_v4<<<dimGrid, dimBlock>>>(N, cuda_tot, cuda_partial_sum, cnt, NULL);
         } else if (kernel_version == 2) {
             n_queens_v2<<<dimGrid, dimBlock>>>(N, cuda_tot, cuda_partial_sum, cnt);
         } else {
-            n_queens<<<dimGrid, dimBlock>>>(N, cuda_tot, cuda_partial_sum, cnt);
+            n_queens<<<dimGrid, dimBlock>>>(N, cuda_tot, cuda_partial_sum, cnt, NULL);
         }
 
         cudaError_t err = cudaDeviceSynchronize();
