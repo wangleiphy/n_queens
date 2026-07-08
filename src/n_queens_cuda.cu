@@ -11,11 +11,13 @@
 
 __device__ unsigned long long global_counter = 0;
 
-// Task fetch: either the per-GPU device counter (sys_counter == NULL) or a
-// host-pinned counter shared by all GPUs of the node (queue scheduler), one
-// system-scope atomic per subproblem.
+// Task fetch: one system-scope atomic per subproblem on a counter that lives
+// either in device memory (static/chunk schedulers, one counter per GPU) or
+// in host-pinned memory shared by all GPUs of the node (queue scheduler).
+// Unconditional so the compiler cannot unswitch the DFS loop (cloning the
+// inline asm would duplicate its .reg declarations).
 __device__ __forceinline__ unsigned long long fetch_task(unsigned long long *sys_counter) {
-    return sys_counter ? atomicAdd_system(sys_counter, 1ULL) : atomicAdd(&global_counter, 1ULL);
+    return atomicAdd_system(sys_counter, 1ULL);
 }
 
 // Sums partial_sum[0..n) into *out (device memory, pre-zeroed).
@@ -449,13 +451,14 @@ long long cuda_n_queens(int N, int rows, long long range_start, long long range_
 
             int *cuda_tot;
             long long *cuda_partial_sum;
+            unsigned long long *cuda_counter;
             CU_SAFE_CALL(cudaMalloc(&cuda_tot, sizeof(int) * chunk * 3));
             CU_SAFE_CALL(cudaMalloc(&cuda_partial_sum, sizeof(long long) * chunk));
+            CU_SAFE_CALL(cudaMalloc(&cuda_counter, sizeof(unsigned long long)));
             vector<long long> host_partial(chunk);
 
             long long done = 0;
             int nchunks = 0;
-            const unsigned long long zero = 0;
 
             while (true) {
                 long long s = next_start.fetch_add(chunk);
@@ -463,18 +466,16 @@ long long cuda_n_queens(int N, int rows, long long range_start, long long range_
                 long long e = s + chunk < range_end ? s + chunk : range_end;
                 long long c = e - s;
 
-                CU_SAFE_CALL(cudaMemcpyToSymbol(global_counter, &zero, sizeof(zero)));
+                CU_SAFE_CALL(cudaMemset(cuda_counter, 0, sizeof(unsigned long long)));
                 CU_SAFE_CALL(cudaMemcpy(cuda_tot, tot.data() + s * 3, sizeof(int) * c * 3, cudaMemcpyHostToDevice));
                 CU_SAFE_CALL(cudaMemset(cuda_partial_sum, 0, sizeof(long long) * c));
 
                 dim3 dimBlock(CU1DBLOCK);
                 dim3 dimGrid(grid_size);
                 if (kernel_version == 4) {
-                    n_queens_v4<<<dimGrid, dimBlock>>>(N, cuda_tot, cuda_partial_sum, c, NULL);
-                } else if (kernel_version == 2) {
-                    n_queens_v2<<<dimGrid, dimBlock>>>(N, cuda_tot, cuda_partial_sum, c);
+                    n_queens_v4<<<dimGrid, dimBlock>>>(N, cuda_tot, cuda_partial_sum, c, cuda_counter);
                 } else {
-                    n_queens<<<dimGrid, dimBlock>>>(N, cuda_tot, cuda_partial_sum, c, NULL);
+                    n_queens<<<dimGrid, dimBlock>>>(N, cuda_tot, cuda_partial_sum, c, cuda_counter);
                 }
                 cudaError_t err = cudaDeviceSynchronize();
                 if (err != cudaSuccess) {
@@ -492,6 +493,7 @@ long long cuda_n_queens(int N, int rows, long long range_start, long long range_
 
             CU_SAFE_CALL(cudaFree(cuda_tot));
             CU_SAFE_CALL(cudaFree(cuda_partial_sum));
+            CU_SAFE_CALL(cudaFree(cuda_counter));
             gettimeofday(&t1, NULL);
             print_with_time("gpu [%d] finish job: %d chunks, %lld subproblems, %.2fms.\n",
                             idx, nchunks, done, time_diff_ms(t0, t1));
@@ -557,15 +559,19 @@ long long cuda_n_queens(int N, int rows, long long range_start, long long range_
         CU_SAFE_CALL(cudaMalloc(&cuda_partial_sum, sizeof(long long) * cnt));
         CU_SAFE_CALL(cudaMemset(cuda_partial_sum, 0, sizeof(long long) * cnt));
 
+        unsigned long long *cuda_counter;
+        CU_SAFE_CALL(cudaMalloc(&cuda_counter, sizeof(unsigned long long)));
+        CU_SAFE_CALL(cudaMemset(cuda_counter, 0, sizeof(unsigned long long)));
+
         dim3 dimBlock(CU1DBLOCK);
         dim3 dimGrid(grid_size);
 
         if (kernel_version == 4) {
-            n_queens_v4<<<dimGrid, dimBlock>>>(N, cuda_tot, cuda_partial_sum, cnt, NULL);
+            n_queens_v4<<<dimGrid, dimBlock>>>(N, cuda_tot, cuda_partial_sum, cnt, cuda_counter);
         } else if (kernel_version == 2) {
             n_queens_v2<<<dimGrid, dimBlock>>>(N, cuda_tot, cuda_partial_sum, cnt);
         } else {
-            n_queens<<<dimGrid, dimBlock>>>(N, cuda_tot, cuda_partial_sum, cnt, NULL);
+            n_queens<<<dimGrid, dimBlock>>>(N, cuda_tot, cuda_partial_sum, cnt, cuda_counter);
         }
 
         cudaError_t err = cudaDeviceSynchronize();
