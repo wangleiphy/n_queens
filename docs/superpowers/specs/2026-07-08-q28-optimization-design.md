@@ -63,6 +63,33 @@ Adopt a change iff:
 (b) ≥3% speedup on N=20/21 on 5090;
 (c) no >5% regression on other archs without an arch-specific dispatch.
 
+## Experiment log (updated as measured; all runs verified against exact counts)
+
+Platform: BCM cluster; primary NV5090 (sm_120, CUDA 12.8, driver 570.172.08).
+Reference workload: N=21, rows=6, static scheduler, single GPU unless noted.
+
+| Experiment | Result | Verdict |
+|---|---|---|
+| Baseline v1 CONFIG2 (160 thr, 2 blk/SM = 320 thr/SM) | 20.8 s | reference (matches README) |
+| v1 CONFIG1 (128 thr, 2 blk/SM = 256 thr/SM) | 24.3 s | Q(28)-capable but slowest |
+| v1 CONFIG3 (192 thr, 2 blk/SM = 384 thr/SM) | 18.1–18.4 s | **+13% over CONFIG2**; N ≤ 22 only |
+| v1 CONFIG4 (224×13, 448 thr/SM), rows=7 | 18.9 s (c3\@rows7 = 19.7 s) | occupancy curve saturating (+4%) |
+| v1 CONFIG5 (128×15, 3 blk = 384 thr/SM) | 18.3 s | threads/SM is what matters, not blocks |
+| rows=7 vs rows=6 (c3) | 19.7 s vs 18.1 s | rows=6 preferred (~9%) |
+| grid 340 vs 1024 (c3) | 18.5 vs 18.1 s | keep 1024 |
+| **v2** register-cached stack top (branchy descend/backtrack) | 55.2 s (c2) | **2.6× slower — rejected.** Divergent branches serialize the warp |
+| **v4** two-row leaf unroll (branch into inner leaf loop) | 35.7 s (c2), 31.0 s (c3) | **72% slower — rejected.** Same reason: v1's uniform predicated loop is the whole trick |
+| ncu profiling | ERR_NVGPUCTRPERM | not permitted on cluster; inference via occupancy sweeps |
+| **queue scheduler**: one host-pinned counter shared by all GPUs via `atomicAdd_system` | 2×V100: N=19 count **too high** (5.13e9 vs 4.97e9); 2×A800 same | **WRONG on PCIe nodes — removed.** System atomics are not atomic across devices here; duplicated task ids |
+| chunk scheduler, fixed 1/24 chunks (1 GPU) | 25.7 s vs 20.8 s static | 24% overhead → replaced by guided sizes |
+| range mode (two halves of N=18, N=20) | sums exactly to Q(N) | correct |
+
+Key insight so far: the v1 kernel's inner loop is effectively optimal for SIMT —
+its only branch is the loop backedge, everything else is predicated, so warps
+never diverge. Both attempted restructurings (v2, v4) lost far more to branch
+divergence than they saved in issue slots or shared-memory traffic. Remaining
+wins are in occupancy configs, scheduling, and scale-out.
+
 ## Q(28) projection method
 
 Measure final build vs baseline on N=21/22 (single 5090) and on a multi-GPU node run;
