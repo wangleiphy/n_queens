@@ -90,6 +90,58 @@ never diverge. Both attempted restructurings (v2, v4) lost far more to branch
 divergence than they saved in issue slots or shared-memory traffic. Remaining
 wins are in occupancy configs, scheduling, and scale-out.
 
+## Algorithmic advances round (user directive: aim for 10×)
+
+**State deduplication / transposition folding — measured, dead.** The DFS
+subtree depends only on `(cur, left & board, right)`, so identical or
+mirror-image states could be folded with multiplicities (exact). Probe
+(`src/dedup_probe.cpp`) on the production subproblem lists:
+
+| N | rows | P (paths) | S (unique canonical) | collapse |
+|---|---|---:|---:|---|
+| 14 | 6 | 120,742 | 119,688 | 1.009 |
+| 18 | 6 | 1,199,146 | 1,195,146 | 1.003 |
+| 18 | 7 | 7,409,150 | 7,354,439 | 1.007 |
+| 14 | 9 | 2,195,994 | 2,048,303 | 1.072 |
+| 16 | 10 | 54,239,483 | 50,737,675 | 1.069 |
+
+Collapse ≤ 1.07 even at 62% of board depth and shrinks with N — for N=28 at
+reachable depths it is ~1.00. Both one-shot dedup and layered BFS-with-merging
+are dead on this problem.
+
+**Closed-form two-row leaf count — the win of this round.** For a live node
+with `popc(cur) == N-2`, choice mask `v`, and `M = last & ~cur & ~(left<<1) &
+~(right>>1)`:
+
+```
+completions = popc(v)·popc(M) − popc(M&v) − popc(M&(v<<1)) − popc(M&(v>>1))
+```
+
+Each placement `p` (single bit) removes exactly the cells `p, p<<1, p>>1`
+from `M`, and the cross-terms decompose bit-by-bit. Verified exhaustively vs
+plain DFS for N=5…15 (`src/closed2_check.cpp`). Consequences: the deepest
+walked tree level (~60% of nodes) disappears; the arithmetic is straight-line
+(17 ops, no loop → no v4-style divergence); stack depth requirement drops to
+N−rows−2, so CONFIG3 becomes legal at N=24/rows=6. Two kernel variants under
+test: v6 (fully predicated) and v7 (short fixed-length branch).
+A three-row closed form was analyzed and rejected: the cross-terms become
+products of p-dependent popcounts (~70 ops for another ×2 tree shrink —
+net loss vs v6's ~46 ops/node).
+
+**Symmetry beyond mirror — analyzed, not implemented (net ~1.1–1.3×).** The
+Klein group {id, column-mirror, row-flip, 180°} acts on solutions with
+orbit-size 4 for generic solutions (T = 4·A + 2·D with a clean last-row-mask
+characterization). But in a row-sequential DFS the row-flip/180° canonical
+constraints only bind at the *last* row — they reweight leaves without pruning
+the walked tree. Orderings that make them prefix-compatible (middle-out or
+top-bottom-alternating rows) require maintaining twice the diagonal masks:
+stack entries grow 16→24-32 B, occupancy drops ~25-35%, per-node cost +20-30%,
+canceling the ×2 tree reduction (net ≈1.1–1.3×) — while adding substantial
+correctness surface (stabilizer classes). The FPGA record computations got
+symmetry nearly free because custom datapaths pay no occupancy cost; this GPU
+kernel does. Full 8-fold (diagonal reflections/90° rotations) additionally
+breaks the row-DFS entirely. Documented as not worth it here.
+
 ## Q(28) projection method
 
 Measure final build vs baseline on N=21/22 (single 5090) and on a multi-GPU node run;
