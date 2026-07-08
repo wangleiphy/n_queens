@@ -18,13 +18,8 @@ int main(int argc, char *argv[]) {
     }
 
     int rows = atoi(argv[2]);
-    const char *kenv = getenv("NQ_KERNEL");
-    int kernel_version = kenv ? atoi(kenv) : 1;
-    // v4 handles the last two rows without stack entries, so it needs one
-    // level less of stack than v1/v2.
-    int depth_slack = (kernel_version == 4) ? 2 : 1;
-    if(STACKSIZE + depth_slack + rows < N) {
-        printf("This configure cannot process %d-queens with pre-placing %d rows. Pre-placed rows should be >= %d.\n", N, rows, N - STACKSIZE - depth_slack);
+    if(STACKSIZE + 1 + rows < N) {
+        printf("This configure cannot process %d-queens with pre-placing %d rows. Pre-placed rows should be >= %d.\n", N, rows, N - STACKSIZE - 1);
         return -1;
     }
 

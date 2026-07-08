@@ -9,13 +9,12 @@
 #include "n_queens.h"
 #include "utils.h"
 
-__device__ unsigned long long global_counter = 0;
-
-// Task fetch: one system-scope atomic per subproblem on a counter that lives
-// either in device memory (static/chunk schedulers, one counter per GPU) or
-// in host-pinned memory shared by all GPUs of the node (queue scheduler).
-// Unconditional so the compiler cannot unswitch the DFS loop (cloning the
-// inline asm would duplicate its .reg declarations).
+// Task fetch: one atomic per subproblem on a per-GPU device counter, reset
+// before each launch. Kept as an unconditional pointer-based atomic so the
+// compiler cannot unswitch the DFS loop (cloning the inline asm would
+// duplicate its .reg declarations). Note: a host-pinned counter shared across
+// GPUs via atomicAdd_system was tried and silently duplicated task ids on
+// PCIe nodes -- do not share this counter between devices.
 __device__ __forceinline__ unsigned long long fetch_task(unsigned long long *sys_counter) {
     return atomicAdd_system(sys_counter, 1ULL);
 }
@@ -28,269 +27,6 @@ __global__ void reduce_partial(const long long *v, long long n, unsigned long lo
         acc += v[i];
     }
     atomicAdd(out, (unsigned long long)acc);
-}
-
-// v2: register-cached top-of-stack. The current DFS level lives in registers
-// (cur,left,right,valid_pos); shared memory is only touched when descending
-// past a level that still has remaining choices (push) or when backtracking
-// (pop). Levels with no remaining choices are never pushed, so every pop
-// yields a level with work. Visits the same tree as v1 in the same order.
-__global__ void n_queens_v2(int N, int *tot, long long *partial_sum, long long cnt) {
-    unsigned long long tid = atomicAdd(&global_counter, 1);
-    const int last = (1 << N) - 1;
-
-    while (tid < cnt) {
-        long long sum = 0;
-        int bottom = ((threadIdx.x / 32) * 32 * STACKSIZE + threadIdx.x % 32) << 4;
-        int cur = tot[tid * 3];
-        int left = tot[tid * 3 + 1];
-        int right = tot[tid * 3 + 2];
-        int valid_pos = last & ~cur & ~left & ~right;
-
-        if(valid_pos == 0) {
-            tid = atomicAdd(&global_counter, 1);
-            continue;
-        }
-
-        asm(".reg .s32 top, p, cc, ll, rr, vv, tmp;\n\t"
-            ".reg .s64 ltmp;\n\t"
-            ".reg .pred pz, pq, pe, z;\n\t"
-            ".shared .align 16 .b8 stack2[" NQ_STR(STACKBYTES) "];\n\t"
-
-            " mov.u32 tmp, stack2;\n\t"
-            " add.s32 %5, %5, tmp;\n\t"                                     // bottom += stack base
-            " mov.u32 top, %5;\n\t"                                         // top = bottom (empty stack)
-
-            " LOOP2:\n\t"
-            " neg.s32 p, %4;\n\t"                                           // p = -v0
-            " and.b32 p, p, %4;\n\t"                                        // p = v0 & -v0
-            " sub.s32 %4, %4, p;\n\t"                                       // v0 -= p
-            " or.b32  cc, %1, p;\n\t"                                       // cc = c0 | p
-            " or.b32  ll, %2, p;\n\t"
-            " shl.b32 ll, ll, 1;\n\t"                                       // ll = (l0 | p) << 1
-            " or.b32  rr, %3, p;\n\t"
-            " shr.b32 rr, rr, 1;\n\t"                                       // rr = (r0 | p) >> 1
-            " lop3.b32 tmp, cc, ll, rr, 0x1;\n\t"                           // ~cc & ~ll & ~rr
-            " and.b32 vv, tmp, %6;\n\t"                                     // vv = last & tmp
-            " popc.b32 tmp, cc;\n\t"
-            " setp.eq.s32 pz, tmp, %7;\n\t"                                 // popc(cc) == N - 1
-            " setp.eq.s32 pq, vv, 0;\n\t"                                   // vv == 0
-            " or.pred z, pz, pq;\n\t"                                       // leaf or dead end
-            " @z bra ZPATH;\n\t"
-
-            // descend: push current level if it still has choices, child -> regs
-            " setp.ne.s32 pq, %4, 0;\n\t"                                   // v0 != 0
-            " @pq st.shared.v4.u32 [top], {%1, %2, %3, %4};\n\t"            // push {c0,l0,r0,v0}
-            " @pq add.s32 top, top, 512;\n\t"
-            " mov.b32 %1, cc;\n\t"
-            " mov.b32 %2, ll;\n\t"
-            " mov.b32 %3, rr;\n\t"
-            " mov.b32 %4, vv;\n\t"
-            " bra.uni LOOP2;\n\t"
-
-            " ZPATH:\n\t"                                                   // count solutions (0 if dead end)
-            " popc.b32 tmp, vv;\n\t"
-            " cvt.s64.s32 ltmp, tmp;\n\t"
-            " add.s64 %0, %0, ltmp;\n\t"                                    // sum += popc(vv)
-            " setp.ne.s32 pq, %4, 0;\n\t"
-            " @pq bra.uni LOOP2;\n\t"                                       // same level still has choices
-            " setp.eq.s32 pe, top, %5;\n\t"
-            " @pe bra FINISH2;\n\t"                                         // stack empty -> done
-            " sub.s32 top, top, 512;\n\t"
-            " ld.shared.v4.u32 {%1, %2, %3, %4}, [top];\n\t"                // pop (always has choices)
-            " bra.uni LOOP2;\n\t"
-
-            " FINISH2:\n\t"
-            :"+l"(sum), "+r"(cur), "+r"(left), "+r"(right), "+r"(valid_pos), "+r"(bottom)  // output
-            :"r"(last), "r"(N - 1)                                          // input
-        );
-
-        partial_sum[tid] = sum;
-        tid = atomicAdd(&global_counter, 1);
-    }
-}
-
-// v4: v1 plus a two-row leaf unroll. A child at depth N-2 (two rows left) is
-// never pushed; instead an inner register-only loop counts its completions:
-// for each choice q in its valid mask, add popc of the resulting last-row
-// mask. Depth-(N-1) nodes are the majority of the tree, and v1 spends a full
-// iteration incl. a shared-memory round trip on each; here they cost ~14
-// issue slots and no shared traffic. Stack depth requirement drops to
-// N - rows - 2. Otherwise identical to v1 (same tree, same order).
-__global__ void n_queens_v4(int N, int *tot, long long *partial_sum, long long cnt, unsigned long long *sys_counter) {
-    unsigned long long tid = fetch_task(sys_counter);
-    const int last = (1 << N) - 1;
-
-    while (tid < cnt) {
-        long long sum = 0;
-        int bottom = ((threadIdx.x / 32) * 32 * STACKSIZE + threadIdx.x % 32) << 4;
-        int cur = tot[tid * 3];
-        int left = tot[tid * 3 + 1];
-        int right = tot[tid * 3 + 2];
-        int valid_pos = last & ~cur & ~left & ~right;
-
-        if(valid_pos == 0) {
-            tid = fetch_task(sys_counter);
-            continue;
-        }
-
-        asm(".reg .s32 top, tmp, tmp2, cq, rq;\n\t"
-            ".reg .s64 ltmp;\n\t"
-            ".reg .pred p, q, z, y, nz;\n\t"
-            ".shared .align 16 .b8 stack4[" NQ_STR(STACKBYTES) "];\n\t"
-
-            " mov.u32 top, %5;\n\t"
-            " mov.u32 tmp, stack4;\n\t"
-            " add.s32 %5, %5, tmp;\n\t"
-            " add.s32 top, top, tmp;\n\t"
-
-            " st.shared.v4.u32 [top], {%1, %2, %3, %4};\n\t"                // stack[top] = {cur, left, right, valid_pos}
-            " add.s32 top, top, 512;\n\t"                                   // top += 512
-
-            " LOOP4:\n\t"
-            " setp.eq.s32 p, top, %5;\n\t"                                  // top == bottom
-            " @p bra FINISH4;\n\t"                                          // done
-
-            " ld.shared.v4.u32 {%1, %2, %3, %4}, [top + -512];\n\t"         // {cur, left, right, valid_pos} = stack[top - 512]
-            " neg.s32 tmp, %4;\n\t"                                         // p = -valid_pos
-            " and.b32 tmp, %4, tmp;\n\t"                                    // p = valid_pos & (-valid_pos)
-            " sub.s32 %4, %4, tmp;\n\t"                                     // valid_pos -= p
-            " st.shared.s32 [top + -500], %4;\n\t"                          // stack[top - 500] = valid_pos
-            " setp.eq.s32 p, %4, 0;\n\t"                                    // p = (valid_pos == 0)
-            " selp.b32 tmp2, 512, 0, p;\n\t"                                // tmp2 = (p == 1 ? 512 : 0)
-            " sub.s32 top, top, tmp2;\n\t"                                  // top -= 512
-
-            " or.b32 %1, %1, tmp;\n\t"                                      // cur = cur | p
-            " or.b32 %2, %2, tmp;\n\t"                                      // left = left | p
-            " shl.b32 %2, %2, 1;\n\t"                                       // left = left << 1
-            " or.b32 %3, %3, tmp;\n\t"                                      // right = right | p
-            " shr.b32 %3, %3, 1;\n\t"                                       // right = right >> 1
-            " lop3.b32 tmp, %1, %2, %3, 0x1;\n\t"                           // tmp = ~cur & ~left & ~right;
-            " and.b32 %4, %6, tmp;\n\t"                                     // valid_pos = last & tmp
-            " popc.b32 tmp, %1;\n\t"                                        // tmp = popc(cur)
-            " setp.eq.s32 p, tmp, %7;\n\t"                                  // popc(cur) == N - 1
-            " setp.eq.s32 y, tmp, %8;\n\t"                                  // popc(cur) == N - 2
-            " setp.eq.s32 q, %4, 0;\n\t"                                    // valid_pos == 0
-            " or.pred z, p, q;\n\t"                                         // valid_pos == 0 || popc(cur) == N - 1
-
-            " popc.b32 tmp, %4;\n\t"                                        // tmp = popc(valid_pos)
-            " cvt.s64.s32 ltmp, tmp;\n\t"                                   // s32 -> s64
-            " selp.b64 ltmp, ltmp, 0, z;\n\t"                               // ltmp = (z == 1 ? ltmp : 0)
-            " add.s64 %0, %0, ltmp;\n\t"                                    // sum += popc(valid_pos)
-
-            " not.pred nz, z;\n\t"
-            " and.pred y, y, nz;\n\t"                                       // live node with two rows left
-            " @y bra LEAF4;\n\t"
-
-            " @!z st.shared.v4.u32 [top], {%1, %2, %3, %4};\n\t"            // stack[top] = {cur, left, right, valid_pos}
-            " selp.b32 tmp, 0, 512, z;\n\t"                                 // tmp = (z == 1 ? 0 : 512)
-            " add.s32 top, top, tmp;\n\t"                                   // top += 512
-            " bra.uni LOOP4;\n\t"
-
-            " LEAF4:\n\t"                                                   // {cur,left,right,valid_pos} = live depth-(N-2) node
-            " LEAFLOOP4:\n\t"
-            " neg.s32 tmp, %4;\n\t"
-            " and.b32 tmp, %4, tmp;\n\t"                                    // q = lowest bit of valid_pos
-            " sub.s32 %4, %4, tmp;\n\t"
-            " or.b32  cq, %1, tmp;\n\t"                                     // cur | q
-            " or.b32  tmp2, %2, tmp;\n\t"
-            " shl.b32 tmp2, tmp2, 1;\n\t"                                   // (left | q) << 1
-            " or.b32  rq, %3, tmp;\n\t"
-            " shr.b32 rq, rq, 1;\n\t"                                       // (right | q) >> 1
-            " lop3.b32 tmp, cq, tmp2, rq, 0x1;\n\t"                         // free cells of the last row
-            " and.b32 tmp, tmp, %6;\n\t"
-            " popc.b32 tmp, tmp;\n\t"
-            " cvt.s64.s32 ltmp, tmp;\n\t"
-            " add.s64 %0, %0, ltmp;\n\t"                                    // each free cell is a solution
-            " setp.ne.s32 p, %4, 0;\n\t"
-            " @p bra LEAFLOOP4;\n\t"
-            " bra.uni LOOP4;\n\t"
-
-            " FINISH4:\n\t"
-            :"+l"(sum), "+r"(cur), "+r"(left), "+r"(right), "+r"(valid_pos), "+r"(bottom)  // output
-            :"r"(last), "r"(N - 1), "r"(N - 2)                              // input
-        );
-
-        partial_sum[tid] = sum;
-        tid = fetch_task(sys_counter);
-    }
-}
-
-// v5: v1 with two predication-only micro-opts (control flow stays uniform):
-// the exhausted-level write-back is skipped, and the solution count uses a
-// predicated 64-bit add instead of selp+add.
-__global__ void n_queens_v5(int N, int *tot, long long *partial_sum, long long cnt, unsigned long long *sys_counter) {
-    unsigned long long tid = fetch_task(sys_counter);
-    const int last = (1 << N) - 1;
-
-    while (tid < cnt) {
-        long long sum = 0;
-        int bottom = ((threadIdx.x / 32) * 32 * STACKSIZE + threadIdx.x % 32) << 4;
-        int cur = tot[tid * 3];
-        int left = tot[tid * 3 + 1];
-        int right = tot[tid * 3 + 2];
-        int valid_pos = last & ~cur & ~left & ~right;
-
-        if(valid_pos == 0) {
-            tid = fetch_task(sys_counter);
-            continue;
-        }
-
-        asm(".reg .s32 top, tmp, tmp2;\n\t"
-            ".reg .s64 ltmp;\n\t"
-            ".reg .pred p, q, z;\n\t"
-            ".shared .align 16 .b8 stack5[" NQ_STR(STACKBYTES) "];\n\t"
-
-            " mov.u32 top, %5;\n\t"
-            " mov.u32 tmp, stack5;\n\t"
-            " add.s32 %5, %5, tmp;\n\t"
-            " add.s32 top, top, tmp;\n\t"
-
-            " st.shared.v4.u32 [top], {%1, %2, %3, %4};\n\t"                // stack[top] = {cur, left, right, valid_pos}
-            " add.s32 top, top, 512;\n\t"                                   // top += 512
-
-            " LOOP5:\n\t"
-            " setp.eq.s32 p, top, %5;\n\t"                                  // top == bottom
-            " @p bra FINISH5;\n\t"                                           // done
-
-            " ld.shared.v4.u32 {%1, %2, %3, %4}, [top + -512];\n\t"         // {cur, left, right, valid_pos} = stack[top - 512]
-            " neg.s32 tmp, %4;\n\t"                                         // p = -valid_pos
-            " and.b32 tmp, %4, tmp;\n\t"                                    // p = valid_pos & (-valid_pos)
-            " sub.s32 %4, %4, tmp;\n\t"                                     // valid_pos -= p
-            " setp.eq.s32 p, %4, 0;\n\t"                                    // p = (valid_pos == 0)
-            " @!p st.shared.s32 [top + -500], %4;\n\t"                      // write back only if level still live
-            " selp.b32 tmp2, 512, 0, p;\n\t"                                // tmp = (p == 1 ? 512 : 0)
-            " sub.s32 top, top, tmp2;\n\t"                                  // top -= 512
-
-            " or.b32 %1, %1, tmp;\n\t"                                      // cur = cur | p
-            " or.b32 %2, %2, tmp;\n\t"                                      // left = left | p
-            " shl.b32 %2, %2, 1;\n\t"                                       // left = left << 1
-            " or.b32 %3, %3, tmp;\n\t"                                      // right = right | p
-            " shr.b32 %3, %3, 1;\n\t"                                       // right = right >> 1
-            " lop3.b32 tmp, %1, %2, %3, 0x1;\n\t"                           // tmp = ~cur & ~left & ~right;
-            " and.b32 %4, %6, tmp;\n\t"                                     // valid_pos = last & tmp
-            " popc.b32 tmp, %1;\n\t"                                        // tmp = popc(cur)
-            " setp.eq.s32 p, tmp, %7;\n\t"                                  // popc(cur) == N - 1
-            " setp.eq.s32 q, %4, 0;\n\t"                                    // valid_pos == 0
-            " or.pred z, p, q;\n\t"                                         // valid_pos == 0 || popc(cur) == N - 1
-
-            " popc.b32 tmp, %4;\n\t"                                        // tmp = popc(valid_pos)
-            " cvt.s64.s32 ltmp, tmp;\n\t"                                   // s32 -> s64
-            " @z add.s64 %0, %0, ltmp;\n\t"                                 // sum += popc(valid_pos) at leaves/dead ends
-
-            " @!z st.shared.v4.u32 [top], {%1, %2, %3, %4};\n\t"            // stack[top] = {cur, left, right, valid_pos}
-            " selp.b32 tmp, 0, 512, z;\n\t"                                 // tmp = (z == 1 ? 0 : 512)
-            " add.s32 top, top, tmp;\n\t"                                   // top += 512
-            " bra.uni LOOP5;\n\t"
-
-            " FINISH5:\n\t"
-            :"+l"(sum), "+r"(cur), "+r"(left), "+r"(right), "+r"(valid_pos), "+r"(bottom)  // output
-            :"r"(last), "r"(N - 1)                                          // input
-        );
-
-        partial_sum[tid] = sum;
-        tid = fetch_task(sys_counter);
-    }
 }
 
 __global__ void n_queens(int N, int *tot, long long *partial_sum, long long cnt, unsigned long long *sys_counter) {
@@ -410,9 +146,7 @@ long long cuda_n_queens(int N, int rows, long long range_start, long long range_
         return -1;
     }
 
-    // kernel version, grid size and scheduler are runtime-selectable for A/B experiments
-    const char *kenv = getenv("NQ_KERNEL");
-    int kernel_version = kenv ? atoi(kenv) : 1;
+    // grid size and scheduler are runtime-selectable
     const char *genv = getenv("NQ_GRID");
     int grid_size = genv ? atoi(genv) : 1024;
     // NQ_SCHED: "static" (default) = one launch per GPU over a fixed split;
@@ -426,13 +160,11 @@ long long cuda_n_queens(int N, int rows, long long range_start, long long range_
     bool chunk_sched = strcmp(sched, "chunk") == 0 || strcmp(sched, "dynamic") == 0;
 
     {
-        int maxb1 = 0, maxb2 = 0;
+        int maxb = 0;
         cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-            &maxb1, static_cast<void (*)(int, int *, long long *, long long, unsigned long long *)>(n_queens), CU1DBLOCK, 0);
-        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&maxb2, n_queens_v4, CU1DBLOCK, 0);
-        print_with_time("kernel=v%d grid=%d block=%d sched=%s occupancy: v1 %d blocks/SM, v4 %d blocks/SM\n",
-                        kernel_version, grid_size, CU1DBLOCK, chunk_sched ? "chunk" : "static",
-                        maxb1, maxb2);
+            &maxb, static_cast<void (*)(int, int *, long long *, long long, unsigned long long *)>(n_queens), CU1DBLOCK, 0);
+        print_with_time("grid=%d block=%d sched=%s occupancy: %d blocks/SM (%d threads/SM)\n",
+                        grid_size, CU1DBLOCK, chunk_sched ? "chunk" : "static", maxb, maxb * CU1DBLOCK);
     }
 
     if (chunk_sched) {
@@ -498,13 +230,7 @@ long long cuda_n_queens(int N, int rows, long long range_start, long long range_
 
                 dim3 dimBlock(CU1DBLOCK);
                 dim3 dimGrid(grid_size);
-                if (kernel_version == 5) {
-                    n_queens_v5<<<dimGrid, dimBlock>>>(N, cuda_tot, cuda_partial_sum, c, cuda_counter);
-                } else if (kernel_version == 4) {
-                    n_queens_v4<<<dimGrid, dimBlock>>>(N, cuda_tot, cuda_partial_sum, c, cuda_counter);
-                } else {
-                    n_queens<<<dimGrid, dimBlock>>>(N, cuda_tot, cuda_partial_sum, c, cuda_counter);
-                }
+                n_queens<<<dimGrid, dimBlock>>>(N, cuda_tot, cuda_partial_sum, c, cuda_counter);
                 cudaError_t err = cudaDeviceSynchronize();
                 if (err != cudaSuccess) {
                     printf("kernel error: %s\n", cudaGetErrorString(err));
@@ -596,15 +322,7 @@ long long cuda_n_queens(int N, int rows, long long range_start, long long range_
         dim3 dimBlock(CU1DBLOCK);
         dim3 dimGrid(grid_size);
 
-        if (kernel_version == 5) {
-            n_queens_v5<<<dimGrid, dimBlock>>>(N, cuda_tot, cuda_partial_sum, cnt, cuda_counter);
-        } else if (kernel_version == 4) {
-            n_queens_v4<<<dimGrid, dimBlock>>>(N, cuda_tot, cuda_partial_sum, cnt, cuda_counter);
-        } else if (kernel_version == 2) {
-            n_queens_v2<<<dimGrid, dimBlock>>>(N, cuda_tot, cuda_partial_sum, cnt);
-        } else {
-            n_queens<<<dimGrid, dimBlock>>>(N, cuda_tot, cuda_partial_sum, cnt, cuda_counter);
-        }
+        n_queens<<<dimGrid, dimBlock>>>(N, cuda_tot, cuda_partial_sum, cnt, cuda_counter);
 
         cudaError_t err = cudaDeviceSynchronize();
         if (err != cudaSuccess) {

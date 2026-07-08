@@ -35,23 +35,9 @@
 #define CU1DBLOCK 192
 #define STACKSIZE 16
 #define STACKBYTES 49152
-#elif defined _USE_CONFIG4_
-// occupancy probe: 224 threads, 2 blocks/SM at 16B entries (448 thr/SM)
-#define CU1DBLOCK 224
-#define STACKSIZE 13
-#define STACKBYTES 46592
-#elif defined _USE_CONFIG5_
-// occupancy probe: 128 threads, 3 blocks/SM at 16B entries (384 thr/SM)
-#define CU1DBLOCK 128
-#define STACKSIZE 15
-#define STACKBYTES 30720
-#elif defined _USE_CONFIG6_
-// Q(28)-capable with v4 (depth = 28 - 6 rows - 2): 128 threads, 2 blocks/SM
-#define CU1DBLOCK 128
-#define STACKSIZE 20
-#define STACKBYTES 40960
 #elif defined _USE_CONFIG7_
-// Q(28)-capable with v1 at rows=6 (depth 21): 96 threads, 3 blocks/SM (288 thr/SM)
+// (configs 4-6 were benchmark probes, see docs/superpowers/specs/)
+// Q(28)-capable at rows=6 (stack depth 21): 96 threads, 3 blocks/SM
 #define CU1DBLOCK 96
 #define STACKSIZE 21
 #define STACKBYTES 32256
