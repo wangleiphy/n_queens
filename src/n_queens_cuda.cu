@@ -498,7 +498,9 @@ long long cuda_n_queens(int N, int rows, long long range_start, long long range_
 
                 dim3 dimBlock(CU1DBLOCK);
                 dim3 dimGrid(grid_size);
-                if (kernel_version == 4) {
+                if (kernel_version == 5) {
+                    n_queens_v5<<<dimGrid, dimBlock>>>(N, cuda_tot, cuda_partial_sum, c, cuda_counter);
+                } else if (kernel_version == 4) {
                     n_queens_v4<<<dimGrid, dimBlock>>>(N, cuda_tot, cuda_partial_sum, c, cuda_counter);
                 } else {
                     n_queens<<<dimGrid, dimBlock>>>(N, cuda_tot, cuda_partial_sum, c, cuda_counter);
